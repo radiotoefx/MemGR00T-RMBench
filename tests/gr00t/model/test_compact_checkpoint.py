@@ -1,13 +1,12 @@
 import json
 
-import pytest
-from safetensors.torch import save_file
-import torch
-
 from gr00t.utils.compact_checkpoint import (
     resolve_compact_checkpoint_chain,
     validate_finite_state_dict,
 )
+import pytest
+from safetensors.torch import save_file
+import torch
 
 
 def _compact(path, base, parent=None):
@@ -25,6 +24,36 @@ def test_resolve_compact_checkpoint_chain_parent_first(tmp_path) -> None:
     child = tmp_path / "child"
     _compact(parent, base)
     _compact(child, base, parent)
+
+    resolved_base, chain = resolve_compact_checkpoint_chain(child)
+
+    assert resolved_base == str(base.resolve())
+    assert chain == [parent.resolve(), child.resolve()]
+
+
+def test_resolve_compact_checkpoint_chain_preserves_hub_base_id(tmp_path) -> None:
+    checkpoint = tmp_path / "checkpoint"
+    _compact(checkpoint, "nvidia/GR00T-N1.7-3B")
+
+    resolved_base, chain = resolve_compact_checkpoint_chain(checkpoint)
+
+    assert resolved_base == "nvidia/GR00T-N1.7-3B"
+    assert chain == [checkpoint.resolve()]
+
+
+def test_resolve_compact_checkpoint_chain_resolves_relative_parent_from_manifest(
+    tmp_path,
+) -> None:
+    base = tmp_path / "base"
+    parent = tmp_path / "parent"
+    child = tmp_path / "nested" / "child"
+    base.mkdir()
+    _compact(parent, base)
+    child.mkdir(parents=True)
+    save_file({"weight": torch.ones(1)}, child / "trainable_model.safetensors")
+    (child / "trainable_model.json").write_text(
+        json.dumps({"base_model_path": "../../base", "parent_checkpoint": "../../parent"})
+    )
 
     resolved_base, chain = resolve_compact_checkpoint_chain(child)
 

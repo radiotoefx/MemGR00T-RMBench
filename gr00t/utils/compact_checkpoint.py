@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import json
 from collections.abc import Mapping
+import json
 from pathlib import Path
 
 import torch
@@ -38,6 +38,24 @@ def resolve_compact_checkpoint_chain(
 ) -> tuple[str, list[Path]]:
     """Return the full base model and parent-first compact delta chain."""
 
+    def resolve_manifest_path(value: str | Path, *, relative_to: Path) -> Path:
+        """Resolve filesystem paths relative to the manifest, preserving Hub IDs."""
+        candidate = Path(value).expanduser()
+        if not candidate.is_absolute():
+            candidate = relative_to / candidate
+        return candidate.resolve()
+
+    def resolve_base(value: str | Path, *, relative_to: Path) -> str:
+        # Hub identifiers such as ``nvidia/GR00T-N1.7-3B`` are not filesystem
+        # paths. Resolve only values that actually identify a local path.
+        candidate = Path(value).expanduser()
+        if candidate.is_absolute():
+            return str(candidate.resolve())
+        local_candidate = relative_to / candidate
+        if local_candidate.exists():
+            return str(local_candidate.resolve())
+        return str(value)
+
     current = Path(checkpoint).resolve()
     child_first: list[Path] = []
     visited: set[Path] = set()
@@ -53,7 +71,7 @@ def resolve_compact_checkpoint_chain(
         manifest = json.loads(manifest_path.read_text())
         manifest_base = manifest.get("base_model_path")
         if manifest_base:
-            resolved_base = str(Path(manifest_base).resolve())
+            resolved_base = resolve_base(manifest_base, relative_to=current)
             if base_model_path is None:
                 base_model_path = resolved_base
             elif base_model_path != resolved_base:
@@ -65,7 +83,7 @@ def resolve_compact_checkpoint_chain(
         parent = manifest.get("parent_checkpoint")
         if not parent:
             break
-        current = Path(parent).resolve()
+        current = resolve_manifest_path(parent, relative_to=current)
 
     if base_model_path is None:
         raise ValueError(f"Compact checkpoint {checkpoint} does not identify a base model")
