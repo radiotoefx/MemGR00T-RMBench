@@ -45,23 +45,41 @@ class Gr00tN1d7ActionHead(nn.Module):
         self.config = config
         self.hidden_size = config.hidden_size
         self.input_embedding_dim = config.input_embedding_dim
+        ttt_config = {
+            "enabled": config.use_ttt,
+            "num_layers": config.ttt_num_layers,
+            "layer_indices": config.ttt_layer_indices,
+            "dim": config.ttt_dim,
+            "hidden_dim": config.ttt_hidden_dim,
+            "base_lr": config.ttt_base_lr,
+            "gate_init": config.ttt_gate_init,
+        }
 
         if config.use_alternate_vl_dit:
             self.model = AlternateVLDiT(
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
                 attend_text_every_n_blocks=config.attend_text_every_n_blocks,
+                ttt_config=ttt_config,
             )
             logger.info("Using AlternateVLDiT for diffusion model")
         else:
             self.model = DiT(
                 **config.diffusion_model_cfg,
                 cross_attention_dim=config.backbone_embedding_dim,
+                ttt_config=ttt_config,
             )
             logger.info("Using DiT for diffusion model")
         self.action_dim = config.max_action_dim
         self.action_horizon = config.action_horizon
         self.num_inference_timesteps = config.num_inference_timesteps
+        self.register_tokens = (
+            nn.Parameter(torch.empty(1, config.ttt_num_register_tokens, self.input_embedding_dim))
+            if config.use_ttt and config.ttt_num_register_tokens > 0
+            else None
+        )
+        if self.register_tokens is not None:
+            nn.init.normal_(self.register_tokens, mean=0.0, std=0.02)
 
         self.state_encoder = CategorySpecificMLP(
             num_categories=config.max_num_embodiments,
@@ -115,15 +133,20 @@ class Gr00tN1d7ActionHead(nn.Module):
         )
         self.num_timestep_buckets = config.num_timestep_buckets
         self.set_trainable_parameters(
-            config.tune_projector, config.tune_diffusion_model, config.tune_vlln
+            config.tune_projector, config.tune_diffusion_model, config.tune_vlln, config.tune_ttt
         )
 
     def set_trainable_parameters(
-        self, tune_projector: bool, tune_diffusion_model: bool, tune_vlln: bool
+        self,
+        tune_projector: bool,
+        tune_diffusion_model: bool,
+        tune_vlln: bool,
+        tune_ttt: bool = True,
     ):
         self.tune_projector = tune_projector
         self.tune_diffusion_model = tune_diffusion_model
         self.tune_vlln = tune_vlln
+        self.tune_ttt = tune_ttt
         for p in self.parameters():
             p.requires_grad = True
         if not tune_projector:
@@ -134,12 +157,20 @@ class Gr00tN1d7ActionHead(nn.Module):
                 self.position_embedding.requires_grad_(False)
         if not tune_diffusion_model:
             self.model.requires_grad_(False)
+        # RoboTTT pretraining freezes the base DiT while training only the new
+        # sequence-modeling layers. Re-enable them after the broad DiT freeze.
+        if self.config.use_ttt:
+            for layer in self.model.ttt_layers():
+                layer.requires_grad_(tune_ttt)
+            if self.register_tokens is not None:
+                self.register_tokens.requires_grad_(tune_ttt)
         if not tune_vlln:
             self.vlln.requires_grad_(False)
             self.vl_self_attention.requires_grad_(False)
         logger.debug(f"Tune action head projector: {self.tune_projector}")
         logger.debug(f"Tune action head diffusion model: {self.tune_diffusion_model}")
         logger.debug(f"Tune action head vlln: {self.tune_vlln}")
+        logger.debug(f"Tune action head TTT: {self.tune_ttt}")
         # Check if any parameters are still trainable. If not, log a warning.
         if not tune_projector and not tune_diffusion_model and not tune_vlln:
             for name, p in self.named_parameters():
@@ -147,6 +178,19 @@ class Gr00tN1d7ActionHead(nn.Module):
                     logger.debug(f"Action head trainable parameter: {name}")
         if not any(p.requires_grad for p in self.parameters()):
             logger.warning("No action head trainable parameters found.")
+
+    def copy_embodiment_projectors_(self, source_id: int, target_id: int) -> None:
+        """Warm-start the target state/action projectors from a pretrained slot.
+
+        The shared DiT and VLM are intentionally untouched. The copy happens only
+        at training startup; checkpoints continue to address the independent
+        target slot and therefore do not depend on an inference-time ID override.
+        """
+        if source_id == target_id:
+            raise ValueError("Projector source and target embodiment IDs must differ")
+        self.state_encoder.copy_category_(source_id, target_id)
+        self.action_encoder.copy_category_(source_id, target_id)
+        self.action_decoder.copy_category_(source_id, target_id)
 
     def set_frozen_modules_to_eval_mode(self):
         """
@@ -179,6 +223,31 @@ class Gr00tN1d7ActionHead(nn.Module):
         backbone_output["backbone_features"] = backbone_features
         return backbone_output
 
+    def reset_ttt_state(self, batch_size: int | None = None) -> None:
+        self.model.reset_ttt_state(batch_size)
+
+    def initialize_ttt_parameters(self) -> None:
+        """Initialize TTT additions after loading a Vanilla checkpoint."""
+        for layer in self.model.ttt_layers():
+            layer.reset_parameters()
+        if self.register_tokens is not None:
+            nn.init.normal_(self.register_tokens, mean=0.0, std=0.02)
+
+    def detach_ttt_state(self) -> None:
+        self.model.detach_ttt_state()
+
+    def ttt_diagnostics(self) -> list[dict[str, float | int]]:
+        return self.model.ttt_diagnostics()
+
+    def _join_state_action_tokens(
+        self, state_features: torch.Tensor, action_features: torch.Tensor
+    ) -> torch.Tensor:
+        tokens = [state_features, action_features]
+        if self.register_tokens is not None:
+            registers = self.register_tokens.expand(state_features.shape[0], -1, -1)
+            tokens.insert(0, registers)
+        return torch.cat(tokens, dim=1)
+
     def forward(self, backbone_output: BatchFeature, action_input: BatchFeature) -> BatchFeature:
         """
         Forward pass through the action head.
@@ -199,6 +268,9 @@ class Gr00tN1d7ActionHead(nn.Module):
         """
         # Set frozen modules to eval
         self.set_frozen_modules_to_eval_mode()
+
+        if self.config.use_ttt and not self.config.ttt_sequence_training:
+            self.reset_ttt_state(action_input.state.shape[0])
 
         backbone_output = self.process_backbone_output(backbone_output)
 
@@ -245,7 +317,7 @@ class Gr00tN1d7ActionHead(nn.Module):
             action_features = action_features + pos_embs
 
         # Join vision, language, state and action embedding along sequence dimension.
-        sa_embs = torch.cat((state_features, action_features), dim=1)
+        sa_embs = self._join_state_action_tokens(state_features, action_features)
         vl_attn_mask = backbone_output.backbone_attention_mask
 
         if self.config.use_alternate_vl_dit:
@@ -284,6 +356,295 @@ class Gr00tN1d7ActionHead(nn.Module):
             "backbone_features": vl_embeds,
             "state_features": state_features,
         }
+
+    def forward_robottt_sequence_prefix_batched(
+        self,
+        backbone_outputs: list[BatchFeature],
+        action_inputs: list[BatchFeature],
+        chunk_size: int,
+    ) -> list[BatchFeature]:
+        """Batch frozen DiT blocks before the first TTT layer across time.
+
+        Only the suffix beginning at the first recurrent TTT block is executed
+        timestep-by-timestep. This preserves fast-state ordering while avoiding
+        repeated single-item execution of the frozen DiT prefix.
+        """
+        if not isinstance(self.model, AlternateVLDiT):
+            raise ValueError("TTT action-prefix batching currently requires AlternateVLDiT")
+        if self.tune_projector or self.tune_diffusion_model or self.tune_vlln:
+            raise ValueError("TTT action-prefix batching requires a fully frozen base action head")
+        if self.register_tokens is not None and self.register_tokens.requires_grad:
+            raise ValueError("TTT action-prefix batching does not support trainable register tokens")
+        if len(backbone_outputs) != len(action_inputs) or not action_inputs:
+            raise ValueError("Backbone and action sequence lengths must match and be non-empty")
+
+        ttt_indices = [
+            index
+            for index, block in enumerate(self.model.transformer_blocks)
+            if block.ttt is not None
+        ]
+        if not ttt_indices:
+            raise ValueError("TTT action-prefix batching requires at least one TTT layer")
+        first_ttt_index = min(ttt_indices)
+        self.set_frozen_modules_to_eval_mode()
+
+        prepared = []
+        # Preserve the legacy per-timestep RNG order: state dropout, flow noise,
+        # then flow time are sampled one timestep at a time.
+        with torch.no_grad():
+            for backbone_output, action_input in zip(backbone_outputs, action_inputs):
+                backbone_output = self.process_backbone_output(backbone_output)
+                vl_embeds = backbone_output.backbone_features
+                embodiment_id = action_input.embodiment_id
+                assert action_input.state.shape[1] == self.config.state_history_length
+                state = action_input.state.view(action_input.state.shape[0], 1, -1)
+                state_features = self.state_encoder(state, embodiment_id)
+                if self.training and self.state_dropout_prob > 0:
+                    do_dropout = (
+                        torch.rand(state_features.shape[0], device=state_features.device)
+                        < self.state_dropout_prob
+                    )
+                    state_features = state_features * (
+                        1 - do_dropout[:, None, None].to(dtype=state_features.dtype)
+                    )
+
+                actions = action_input.action
+                noise = torch.randn(actions.shape, device=actions.device, dtype=actions.dtype)
+                flow_time = self.sample_time(
+                    actions.shape[0], device=actions.device, dtype=actions.dtype
+                )[:, None, None]
+                noisy_trajectory = (1 - flow_time) * noise + flow_time * actions
+                velocity = actions - noise
+                timestep = (flow_time[:, 0, 0] * self.num_timestep_buckets).long()
+                action_features = self.action_encoder(
+                    noisy_trajectory, timestep, embodiment_id
+                )
+                if self.config.add_pos_embed:
+                    pos_ids = torch.arange(
+                        action_features.shape[1], dtype=torch.long, device=vl_embeds.device
+                    )
+                    action_features = action_features + self.position_embedding(pos_ids).unsqueeze(0)
+                prepared.append(
+                    {
+                        "hidden_states": self._join_state_action_tokens(
+                            state_features, action_features
+                        ),
+                        "encoder_hidden_states": vl_embeds,
+                        "image_mask": backbone_output.image_mask,
+                        "backbone_attention_mask": backbone_output.backbone_attention_mask,
+                        "timestep": timestep,
+                        "velocity": velocity,
+                        "action_mask": action_input.action_mask,
+                        "actions": actions,
+                        "embodiment_id": embodiment_id,
+                        "backbone_features": vl_embeds,
+                        "state_features": state_features,
+                    }
+                )
+
+        prefix_hidden_states: list[torch.Tensor] = []
+        prefix_temb: list[torch.Tensor] = []
+        for start in range(0, len(prepared), chunk_size):
+            chunk = prepared[start : start + chunk_size]
+            batch_size = chunk[0]["hidden_states"].shape[0]
+            with torch.no_grad():
+                hidden_states = torch.cat(
+                    [item["hidden_states"] for item in chunk], dim=0
+                ).contiguous()
+                encoder_hidden_states = torch.cat(
+                    [item["encoder_hidden_states"] for item in chunk], dim=0
+                ).contiguous()
+                image_mask = torch.cat([item["image_mask"] for item in chunk], dim=0)
+                backbone_attention_mask = torch.cat(
+                    [item["backbone_attention_mask"] for item in chunk], dim=0
+                )
+                timestep = torch.cat([item["timestep"] for item in chunk], dim=0)
+                temb = self.model.timestep_encoder(timestep)
+                image_attention_mask = image_mask & backbone_attention_mask
+                non_image_attention_mask = (~image_mask) & backbone_attention_mask
+
+                for index, block in enumerate(
+                    self.model.transformer_blocks[:first_ttt_index]
+                ):
+                    if index % 2 == 1:
+                        hidden_states = block(
+                            hidden_states,
+                            attention_mask=None,
+                            encoder_hidden_states=None,
+                            encoder_attention_mask=None,
+                            temb=temb,
+                            ttt_update_enabled=False,
+                        )
+                    else:
+                        curr_mask = (
+                            non_image_attention_mask
+                            if index % (2 * self.model.attend_text_every_n_blocks) == 0
+                            else image_attention_mask
+                        )
+                        hidden_states = block(
+                            hidden_states,
+                            attention_mask=None,
+                            encoder_hidden_states=encoder_hidden_states,
+                            encoder_attention_mask=curr_mask,
+                            temb=temb,
+                            ttt_update_enabled=False,
+                        )
+
+            for index in range(len(chunk)):
+                item_start = index * batch_size
+                item_end = item_start + batch_size
+                prefix_hidden_states.append(hidden_states[item_start:item_end])
+                prefix_temb.append(temb[item_start:item_end])
+
+        def run_ttt_layer_over_time(
+            index: int, hidden_states_by_time: list[torch.Tensor]
+        ) -> list[torch.Tensor]:
+            """Preserve the recurrent update order for one TTT layer."""
+            block = self.model.transformer_blocks[index]
+            outputs_by_time = []
+            for item, hidden_states, temb in zip(
+                prepared, hidden_states_by_time, prefix_temb
+            ):
+                image_attention_mask = (
+                    item["image_mask"] & item["backbone_attention_mask"]
+                )
+                non_image_attention_mask = (
+                    ~item["image_mask"]
+                ) & item["backbone_attention_mask"]
+                if index % 2 == 1:
+                    hidden_states = block(
+                        hidden_states,
+                        attention_mask=None,
+                        encoder_hidden_states=None,
+                        encoder_attention_mask=None,
+                        temb=temb,
+                        ttt_update_enabled=True,
+                    )
+                else:
+                    curr_mask = (
+                        non_image_attention_mask
+                        if index % (2 * self.model.attend_text_every_n_blocks) == 0
+                        else image_attention_mask
+                    )
+                    hidden_states = block(
+                        hidden_states,
+                        attention_mask=None,
+                        encoder_hidden_states=item["encoder_hidden_states"],
+                        encoder_attention_mask=curr_mask,
+                        temb=temb,
+                        ttt_update_enabled=True,
+                    )
+                outputs_by_time.append(hidden_states)
+            return outputs_by_time
+
+        def run_frozen_span_batched(
+            start_index: int,
+            end_index: int,
+            hidden_states_by_time: list[torch.Tensor],
+        ) -> list[torch.Tensor]:
+            """Batch a deterministic frozen span between recurrent TTT layers.
+
+            Autograd intentionally remains enabled: although the span's own
+            parameters are frozen, gradients must cross it to earlier TTT
+            layers in the same TBPTT segment.
+            """
+            if start_index >= end_index:
+                return hidden_states_by_time
+            outputs_by_time = []
+            for start in range(0, len(prepared), chunk_size):
+                chunk = prepared[start : start + chunk_size]
+                hidden_chunk = hidden_states_by_time[start : start + chunk_size]
+                batch_size = hidden_chunk[0].shape[0]
+                hidden_states = torch.cat(hidden_chunk, dim=0).contiguous()
+                temb = torch.cat(prefix_temb[start : start + len(chunk)], dim=0)
+                encoder_hidden_states = torch.cat(
+                    [item["encoder_hidden_states"] for item in chunk], dim=0
+                ).contiguous()
+                image_mask = torch.cat([item["image_mask"] for item in chunk], dim=0)
+                backbone_attention_mask = torch.cat(
+                    [item["backbone_attention_mask"] for item in chunk], dim=0
+                )
+                image_attention_mask = image_mask & backbone_attention_mask
+                non_image_attention_mask = (~image_mask) & backbone_attention_mask
+                for index in range(start_index, end_index):
+                    block = self.model.transformer_blocks[index]
+                    if block.ttt is not None:
+                        raise RuntimeError(
+                            f"TTT layer {index} cannot be executed in a frozen batched span"
+                        )
+                    if index % 2 == 1:
+                        hidden_states = block(
+                            hidden_states,
+                            attention_mask=None,
+                            encoder_hidden_states=None,
+                            encoder_attention_mask=None,
+                            temb=temb,
+                            ttt_update_enabled=False,
+                        )
+                    else:
+                        curr_mask = (
+                            non_image_attention_mask
+                            if index % (2 * self.model.attend_text_every_n_blocks) == 0
+                            else image_attention_mask
+                        )
+                        hidden_states = block(
+                            hidden_states,
+                            attention_mask=None,
+                            encoder_hidden_states=encoder_hidden_states,
+                            encoder_attention_mask=curr_mask,
+                            temb=temb,
+                            ttt_update_enabled=False,
+                        )
+                for offset in range(len(chunk)):
+                    item_start = offset * batch_size
+                    item_end = item_start + batch_size
+                    outputs_by_time.append(hidden_states[item_start:item_end])
+            return outputs_by_time
+
+        # The recurrent dependencies form one independent chain per TTT layer.
+        # Process each such chain in time order, while batching deterministic
+        # frozen spans between chains across time. This is algebraically the
+        # same dependency graph as timestep-major execution.
+        hidden_states_by_time = prefix_hidden_states
+        for position, ttt_index in enumerate(ttt_indices):
+            hidden_states_by_time = run_ttt_layer_over_time(
+                ttt_index, hidden_states_by_time
+            )
+            next_ttt_index = (
+                ttt_indices[position + 1]
+                if position + 1 < len(ttt_indices)
+                else len(self.model.transformer_blocks)
+            )
+            hidden_states_by_time = run_frozen_span_batched(
+                ttt_index + 1, next_ttt_index, hidden_states_by_time
+            )
+
+        outputs = []
+        for item, hidden_states, temb in zip(
+            prepared, hidden_states_by_time, prefix_temb
+        ):
+            shift, scale = self.model.proj_out_1(F.silu(temb)).chunk(2, dim=1)
+            model_output = self.model.norm_out(hidden_states) * (1 + scale[:, None])
+            model_output = self.model.proj_out_2(model_output + shift[:, None])
+            pred = self.action_decoder(model_output, item["embodiment_id"])
+            pred_actions = pred[:, -item["actions"].shape[1] :]
+            action_loss = (
+                F.mse_loss(pred_actions, item["velocity"], reduction="none")
+                * item["action_mask"]
+            )
+            loss = action_loss.sum() / (item["action_mask"].sum() + 1e-6)
+            outputs.append(
+                BatchFeature(
+                    data={
+                        "loss": loss,
+                        "action_loss": action_loss,
+                        "action_mask": item["action_mask"],
+                        "backbone_features": item["backbone_features"],
+                        "state_features": item["state_features"],
+                    }
+                )
+            )
+        return outputs
 
     def _encode_features(
         self, backbone_output: BatchFeature, action_input: BatchFeature
@@ -343,14 +704,32 @@ class Gr00tN1d7ActionHead(nn.Module):
         """
         vl_embeds = backbone_features
 
-        # Set initial actions as the sampled noise.
+        # Set initial actions from an explicit episode object or a policy-private
+        # generator. Neither path depends on the process-global Torch RNG.
         batch_size = vl_embeds.shape[0]
         device = vl_embeds.device
-        actions = torch.randn(
-            size=(batch_size, self.config.action_horizon, self.action_dim),
-            dtype=vl_embeds.dtype,
-            device=device,
-        )
+        expected_noise_shape = (batch_size, self.config.action_horizon, self.action_dim)
+        initial_noise = None if options is None else options.get("initial_noise")
+        if initial_noise is not None:
+            if not isinstance(initial_noise, torch.Tensor):
+                raise TypeError("initial_noise must be a torch.Tensor")
+            if tuple(initial_noise.shape) != expected_noise_shape:
+                raise ValueError(
+                    f"initial_noise shape {tuple(initial_noise.shape)} does not match "
+                    f"{expected_noise_shape}"
+                )
+            actions = initial_noise.to(device=device, dtype=vl_embeds.dtype).clone()
+        else:
+            generator = None if options is None else options.get("generator")
+            if generator is not None and not isinstance(generator, torch.Generator):
+                raise TypeError("generator must be a torch.Generator")
+            actions = torch.randn(
+                size=expected_noise_shape,
+                dtype=vl_embeds.dtype,
+                device=device,
+                generator=generator,
+            )
+        sampled_initial_noise = actions.detach().clone()
 
         dt = 1.0 / self.num_inference_timesteps
         vel_strength = torch.ones_like(actions)
@@ -394,6 +773,9 @@ class Gr00tN1d7ActionHead(nn.Module):
             ] = ramp[None, :, None].to(device)
 
         # Run denoising steps.
+        ttt_state_update_only = bool(
+            options is not None and options.get("ttt_state_update_only", False)
+        )
         for t in range(self.num_inference_timesteps):
             t_cont = t / float(self.num_inference_timesteps)  # e.g. goes 0, 1/N, 2/N, ...
             t_discretized = int(t_cont * self.num_timestep_buckets)
@@ -410,7 +792,7 @@ class Gr00tN1d7ActionHead(nn.Module):
                 action_features = action_features + pos_embs
 
             # Join vision, language, state and action embedding along sequence dimension.
-            sa_embs = torch.cat((state_features, action_features), dim=1)
+            sa_embs = self._join_state_action_tokens(state_features, action_features)
 
             # Run model forward.
             if self.config.use_alternate_vl_dit:
@@ -420,12 +802,32 @@ class Gr00tN1d7ActionHead(nn.Module):
                     timestep=timesteps_tensor,
                     image_mask=backbone_output.image_mask,
                     backbone_attention_mask=backbone_output.backbone_attention_mask,
+                    ttt_update_enabled=(
+                        self.config.ttt_update_during_rollout and t == 0
+                    ),
                 )
             else:
                 model_output = self.model(
                     hidden_states=sa_embs,
                     encoder_hidden_states=vl_embeds,
                     timestep=timesteps_tensor,
+                    ttt_update_enabled=(
+                        self.config.ttt_update_during_rollout and t == 0
+                    ),
+                )
+            if ttt_state_update_only:
+                # Offline rollout-state priming only needs the first denoising
+                # forward: TTT writes are enabled at t=0 and disabled for every
+                # later denoising step. The predicted action is deliberately
+                # unused by that probe, so the remaining deterministic steps
+                # cannot affect episode-local fast weights.
+                return BatchFeature(
+                    data={
+                        "action_pred": actions,
+                        "initial_noise": sampled_initial_noise,
+                        "backbone_features": vl_embeds,
+                        "state_features": state_features,
+                    }
                 )
             pred = self.action_decoder(model_output, embodiment_id)
 
@@ -437,6 +839,7 @@ class Gr00tN1d7ActionHead(nn.Module):
         return BatchFeature(
             data={
                 "action_pred": actions,
+                "initial_noise": sampled_initial_noise,
                 "backbone_features": vl_embeds,
                 "state_features": state_features,
             }
@@ -593,12 +996,178 @@ class Gr00tN1d7(PreTrainedModel):
         Returns:
             BatchFeature containing loss and other outputs
         """
+        if "robottt_sequence" in inputs:
+            return self.forward_robottt_sequence(
+                inputs["robottt_sequence"],
+                reset_state=inputs.get("robottt_reset_state", True),
+                timestep_offset=inputs.get("robottt_timestep_offset", 0),
+                total_sequence_length=inputs.get("robottt_total_sequence_length"),
+            )
+
         # Prepare inputs for backbone and action head
         backbone_inputs, action_inputs = self.prepare_input(inputs)
         backbone_outputs = self.backbone(backbone_inputs)
         action_outputs = self.action_head(backbone_outputs, action_inputs)
 
         return action_outputs
+
+    def forward_robottt_sequence(
+        self,
+        timestep_inputs: list[dict],
+        reset_state: bool = True,
+        timestep_offset: int = 0,
+        total_sequence_length: int | None = None,
+    ) -> BatchFeature:
+        """Train recurrent TTT memory on one ordered window per batch item.
+
+        The collator transposes a batch of episode windows into a list of
+        timestep batches. Fast weights are reset once at the window boundary,
+        carried between timesteps, and detached (but not reset) at TBPTT
+        boundaries. Each action-head call independently samples flow time/noise,
+        matching sequence action forcing.
+        """
+        if not self.config.use_ttt or not self.config.ttt_sequence_training:
+            raise ValueError(
+                "robottt_sequence input requires use_ttt=True and ttt_sequence_training=True"
+            )
+        if not timestep_inputs:
+            raise ValueError("robottt_sequence cannot be empty")
+
+        if reset_state:
+            self.reset_ttt_state()
+        else:
+            # The previous segment has already been backpropagated. Preserve
+            # fast-weight values while cutting the graph at this boundary.
+            self.detach_ttt_state()
+        prepared_inputs = [self.prepare_input(step_inputs) for step_inputs in timestep_inputs]
+        backbone_chunk_size = int(getattr(self.config, "ttt_backbone_chunk_size", 1))
+        if backbone_chunk_size > 1:
+            if any(parameter.requires_grad for parameter in self.backbone.parameters()):
+                raise ValueError("TTT backbone chunking requires a fully frozen backbone")
+            backbone_outputs = []
+            first_action_input = prepared_inputs[0][1]
+            batch_tensor = next(
+                (value for value in first_action_input.values() if isinstance(value, torch.Tensor)),
+                None,
+            )
+            if batch_tensor is None:
+                raise ValueError("Cannot infer sequence batch size from action inputs")
+            batch_size = batch_tensor.shape[0]
+            for start in range(0, len(prepared_inputs), backbone_chunk_size):
+                chunk = prepared_inputs[start : start + backbone_chunk_size]
+                merged_backbone_inputs = BatchFeature(
+                    data={
+                        key: torch.cat([item[0][key] for item in chunk], dim=0)
+                        for key in chunk[0][0]
+                    }
+                )
+                with torch.no_grad():
+                    merged_output = self.backbone(merged_backbone_inputs)
+                for index in range(len(chunk)):
+                    item_start = index * batch_size
+                    item_end = item_start + batch_size
+                    backbone_outputs.append(
+                        BatchFeature(
+                            data={
+                                key: value[item_start:item_end]
+                                for key, value in merged_output.items()
+                            }
+                        )
+                    )
+        else:
+            backbone_outputs = [self.backbone(item[0]) for item in prepared_inputs]
+
+        timestep_losses = []
+        action_losses = []
+        action_masks = []
+        segment_length = self.config.ttt_tbptt_segment_length
+
+        action_prefix_chunk_size = int(
+            getattr(self.config, "ttt_action_prefix_chunk_size", 1)
+        )
+        timestep_outputs = []
+        if action_prefix_chunk_size > 1:
+            for start in range(0, len(prepared_inputs), segment_length):
+                if start > 0:
+                    self.detach_ttt_state()
+                timestep_outputs.extend(
+                    self.action_head.forward_robottt_sequence_prefix_batched(
+                        backbone_outputs[start : start + segment_length],
+                        [item[1] for item in prepared_inputs[start : start + segment_length]],
+                        chunk_size=action_prefix_chunk_size,
+                    )
+                )
+        else:
+            for timestep, ((_, action_inputs), backbone_output) in enumerate(
+                zip(prepared_inputs, backbone_outputs)
+            ):
+                if timestep > 0 and timestep % segment_length == 0:
+                    self.detach_ttt_state()
+                timestep_outputs.append(self.action_head(backbone_output, action_inputs))
+
+        for outputs in timestep_outputs:
+            timestep_losses.append(outputs["loss"])
+            action_losses.append(outputs["action_loss"])
+            action_masks.append(outputs["action_mask"])
+
+        total_sequence_length = total_sequence_length or len(timestep_inputs)
+        decision_start = int(
+            total_sequence_length
+            * float(getattr(self.config, "ttt_decision_loss_start_fraction", 1.0))
+        )
+        decision_weight = float(getattr(self.config, "ttt_decision_loss_weight", 1.0))
+        decision_action_indices = getattr(
+            self.config, "ttt_decision_action_indices", None
+        )
+        effective_timestep_losses = torch.stack(timestep_losses)
+        if decision_action_indices is not None:
+            if not decision_action_indices:
+                raise ValueError("ttt_decision_action_indices must be non-empty when provided")
+            action_dim = action_losses[0].shape[-1]
+            if max(decision_action_indices) >= action_dim:
+                raise ValueError(
+                    "ttt_decision_action_indices contains an index outside the action dimension "
+                    f"{action_dim}: {decision_action_indices}"
+                )
+            selected_indices = torch.tensor(
+                decision_action_indices,
+                device=action_losses[0].device,
+                dtype=torch.long,
+            )
+            selected_losses = []
+            for action_loss, action_mask in zip(action_losses, action_masks):
+                selected_loss = action_loss.index_select(-1, selected_indices)
+                selected_mask = action_mask.index_select(-1, selected_indices)
+                selected_losses.append(
+                    selected_loss.sum() / (selected_mask.sum() + 1e-6)
+                )
+            selected_timestep_losses = torch.stack(selected_losses)
+        else:
+            selected_timestep_losses = effective_timestep_losses
+        loss_weights = torch.ones(
+            len(timestep_losses),
+            device=timestep_losses[0].device,
+            dtype=timestep_losses[0].dtype,
+        )
+        local_decision_start = max(0, decision_start - timestep_offset)
+        if local_decision_start < len(loss_weights):
+            loss_weights[local_decision_start:] = decision_weight
+            effective_timestep_losses = effective_timestep_losses.clone()
+            effective_timestep_losses[local_decision_start:] = selected_timestep_losses[
+                local_decision_start:
+            ]
+
+        return BatchFeature(
+            data={
+                "loss": (effective_timestep_losses * loss_weights).sum()
+                / loss_weights.sum(),
+                "timestep_loss": effective_timestep_losses,
+                "full_timestep_loss": torch.stack(timestep_losses),
+                "action_loss": torch.stack(action_losses, dim=1),
+                "action_mask": torch.stack(action_masks, dim=1),
+                "loss_weights": loss_weights,
+            }
+        )
 
     def get_action(self, inputs: dict, options: dict[str, Any] | None = None) -> BatchFeature:
         """
@@ -612,6 +1181,17 @@ class Gr00tN1d7(PreTrainedModel):
         action_outputs = self.action_head.get_action(backbone_outputs, action_inputs, options)
 
         return action_outputs
+
+    def reset_ttt_state(self, batch_size: int | None = None) -> None:
+        """Reset episode-local RoboTTT fast weights to their learned initialization."""
+        self.action_head.reset_ttt_state(batch_size)
+
+    def detach_ttt_state(self) -> None:
+        """Detach fast weights at a TBPTT segment boundary without clearing memory."""
+        self.action_head.detach_ttt_state()
+
+    def ttt_diagnostics(self) -> list[dict[str, float | int]]:
+        return self.action_head.ttt_diagnostics()
 
     @property
     def device(self):

@@ -1,9 +1,11 @@
-# CLAUDE.md — Isaac GR00T N1.7
+# CLAUDE.md — MemGR00T-RMBench
 
 ## Project overview
 
-Isaac GR00T N1.7 is an open vision-language-action (VLA) model for generalized humanoid robot skills.
-The repo contains the model, training pipeline, evaluation harness, and deployment tooling.
+MemGR00T-RMBench is an independent research derivative of NVIDIA Isaac GR00T
+N1.7. It preserves the upstream model, training, evaluation, and deployment
+interfaces while adding episode-local fast memory and an auditable RMBench
+boundary. It is not an NVIDIA product.
 
 - **Language:** Python 3.12 (dGPU, Thor, DGX Spark); Python 3.10 (Orin — see deployment dir)
 - **Package manager:** [uv](https://docs.astral.sh/uv/)
@@ -67,7 +69,8 @@ getting_started/    # User-facing guides and notebooks
 
 - Test markers: `gpu` (requires GPU), default is CPU-safe
 - Fixtures live in `tests/fixtures/` and `demo_data/`
-- CI runs CPU and GPU tests in separate jobs with 300s timeout
+- The public lightweight CI runs source checks only; run CPU/GPU suites in a
+  provisioned GR00T environment before releases
 
 ## Deployment platforms
 

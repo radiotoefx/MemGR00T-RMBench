@@ -137,6 +137,11 @@ class TestGr00tPolicyInit:
     def test_policy_embodiment_tag(self, policy):
         assert policy.embodiment_tag is not None
 
+    def test_incomplete_dirty_identity_is_not_formally_eligible(self, policy):
+        metadata = policy.get_metadata()
+        assert metadata["formal_eligible"] is False
+        assert "policy_seed_not_explicit" in metadata["formal_blockers"]
+
 
 class TestGr00tPolicyCheckObservation:
     def test_valid_observation_passes(self, policy):
@@ -168,6 +173,73 @@ class TestGr00tPolicyGetAction:
         action, info = policy.get_action(obs)
         assert isinstance(action, dict)
         assert isinstance(info, dict)
+
+    def test_get_action_uses_private_generator_and_reports_noise_id(self, policy):
+        _, info = policy.get_action(_make_observation())
+        options = policy.model.get_action.call_args.kwargs["options"]
+        assert options["generator"] is policy._policy_device_generator
+        assert info["noise_mode"] == "independent"
+        assert info["noise_id"].startswith("noise-")
+
+    def test_episode_common_reuses_initial_noise(self, policy):
+        initial_noise = torch.randn(1, 16, 7)
+        policy.noise_mode = "episode_common"
+        policy._begin_noise_episode()
+        policy.model.get_action.return_value = BatchFeature(
+            data={
+                "action_pred": torch.randn(1, 16, 7),
+                "initial_noise": initial_noise,
+            }
+        )
+
+        _, first_info = policy.get_action(_make_observation())
+        _, second_info = policy.get_action(_make_observation())
+
+        assert first_info["noise_id"] == second_info["noise_id"]
+        second_options = policy.model.get_action.call_args.kwargs["options"]
+        torch.testing.assert_close(second_options["initial_noise"], initial_noise)
+
+
+class TestGr00tPolicyReset:
+    def test_reset_reseeds_policy_rng_and_clears_memory(self, policy):
+        global_state = torch.random.get_rng_state().clone()
+        first = policy.reset({"seed": 123})
+        second = policy.reset({"seed": 123})
+
+        assert first["rng_reseeded"] is True
+        assert first["memory_cleared"] is False
+        assert first["policy_seed"] == 123
+        assert first["noise_mode"] == "independent"
+        assert first["noise_id"] == second["noise_id"]
+        torch.testing.assert_close(torch.random.get_rng_state(), global_state)
+        policy.model.reset_ttt_state.assert_not_called()
+
+    def test_reset_memory_and_rng_controls_are_independent(self, policy):
+        policy.use_ttt = True
+        response = policy.reset(
+            {"clear_memory": True, "reseed_rng": False, "reset_noise": False}
+        )
+
+        assert response["memory_cleared"] is True
+        assert response["rng_reseeded"] is False
+        policy.model.reset_ttt_state.assert_called_once_with()
+
+    def test_memory_only_reset_preserves_episode_common_noise(self, policy):
+        policy.use_ttt = True
+        policy.noise_mode = "episode_common"
+        policy._begin_noise_episode()
+        noise_id = policy._current_noise_id
+
+        response = policy.reset()
+
+        assert response["memory_cleared"] is True
+        assert response["rng_reseeded"] is False
+        assert response["noise_id"] == noise_id
+
+    @pytest.mark.parametrize("seed", [-1, 1.5, True])
+    def test_reset_rejects_invalid_seed(self, policy, seed):
+        with pytest.raises((TypeError, ValueError), match="seed"):
+            policy.reset({"seed": seed})
 
 
 class _NumpyLanguageSimPolicy:

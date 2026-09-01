@@ -68,6 +68,7 @@ class Gr00tN1d7Config(PretrainedConfig):
         False  # Global flag to enable per-embodiment sin/cos encoding
     )
     use_percentiles: bool = True
+    use_relative_action_percentiles: bool = True
     use_relative_action: bool = False
 
     # Action head configuration parameters
@@ -87,6 +88,27 @@ class Gr00tN1d7Config(PretrainedConfig):
     max_seq_len: int = 1024
     use_alternate_vl_dit: bool = True  # True for AlternateVLDiT, False for DiT
     attend_text_every_n_blocks: int = 2
+
+    # RoboTTT recurrent fast-weight memory. Disabled for checkpoint compatibility.
+    use_ttt: bool = False
+    ttt_num_layers: int = 2
+    ttt_layer_indices: list[int] | None = None
+    ttt_dim: int = 256
+    ttt_hidden_dim: int = 1024
+    ttt_base_lr: float = 0.1
+    ttt_gate_init: float = 0.001
+    ttt_num_register_tokens: int = 0
+    ttt_sequence_training: bool = False
+    ttt_sequence_length: int = 32
+    ttt_sequence_stride: int | None = None
+    ttt_tbptt_segment_length: int = 32
+    ttt_segmented_backward: bool = True
+    ttt_backbone_chunk_size: int = 1
+    ttt_action_prefix_chunk_size: int = 1
+    ttt_decision_loss_start_fraction: float = 1.0
+    ttt_decision_loss_weight: float = 1.0
+    ttt_decision_action_indices: list[int] | None = None
+    ttt_update_during_rollout: bool = True
 
     diffusion_model_cfg: dict = field(
         default_factory=lambda: {
@@ -113,6 +135,7 @@ class Gr00tN1d7Config(PretrainedConfig):
     tune_projector: bool = True
     tune_diffusion_model: bool = True
     tune_vlln: bool = True
+    tune_ttt: bool = True
 
     # State augmentation parameters
     state_dropout_prob: float = 0.8  # State dropout probability

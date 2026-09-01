@@ -35,7 +35,7 @@ docker run -it --rm --gpus all \
 Then, inside the container:
 
 ```bash
-git clone --recurse-submodules https://github.com/NVIDIA/Isaac-GR00T /workspace/Isaac-GR00T
+git clone --recurse-submodules https://github.com/radiotoefx/MemGR00T-RMBench /workspace/MemGR00T-RMBench
 cd /workspace/Isaac-GR00T
 export PYTHONPATH="$PWD${PYTHONPATH:+:$PYTHONPATH}"
 python -c "import gr00t; print('GR00T ready')"

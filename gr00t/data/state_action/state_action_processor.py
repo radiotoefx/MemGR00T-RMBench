@@ -65,6 +65,7 @@ class StateActionProcessor:
         modality_configs: dict[str, dict[str, ModalityConfig]],
         statistics: (dict[str, dict[str, dict[str, dict[str, list[float]]]]] | None) = None,
         use_percentiles: bool = False,
+        use_relative_action_percentiles: bool = False,
         clip_outliers: bool = True,
         apply_sincos_state_encoding: bool = False,
         use_relative_action: bool = False,
@@ -89,6 +90,10 @@ class StateActionProcessor:
         self.modality_configs = parse_modality_configs(modality_configs)
         self.statistics: dict[str, dict[str, dict[str, dict[str, list[float]]]]] = {}
         self.use_percentiles = use_percentiles
+        # Old checkpoints used raw min/max for relative actions even when
+        # absolute actions used percentiles. Preserve that unless the saved
+        # processor config explicitly opts into relative-action percentiles.
+        self.use_relative_action_percentiles = use_relative_action_percentiles
         self.clip_outliers = clip_outliers
         self.apply_sincos_state_encoding = apply_sincos_state_encoding
         self.use_relative_action = use_relative_action
@@ -198,9 +203,13 @@ class StateActionProcessor:
                                     f"in embodiment '{embodiment_tag}' but not found"
                                 )
                             action_dim = self.norm_params[embodiment_tag]["action"][key]["dim"]
-                            self.norm_params[embodiment_tag]["action"][key] = nested_dict_to_numpy(
+                            relative_params = nested_dict_to_numpy(
                                 self.statistics[embodiment_tag]["relative_action"][key]
                             )
+                            if self.use_percentiles and self.use_relative_action_percentiles:
+                                relative_params["min"] = relative_params["q01"].copy()
+                                relative_params["max"] = relative_params["q99"].copy()
+                            self.norm_params[embodiment_tag]["action"][key] = relative_params
                             self.norm_params[embodiment_tag]["action"][key]["dim"] = action_dim
 
     def apply_state(

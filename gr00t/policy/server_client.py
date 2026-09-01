@@ -13,6 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
+import copy
 from dataclasses import dataclass
 import functools
 import io
@@ -151,6 +152,7 @@ class PolicyServer:
     # Bounded linger (ms) on close so a pending reply (e.g. the `kill` ack)
     # flushes instead of being dropped, while still releasing the port promptly.
     _CLOSE_LINGER_MS = 1000
+    _FRESHNESS_FIELDS = ("episode_id", "request_id", "source_step_id")
 
     def __init__(
         self,
@@ -168,16 +170,29 @@ class PolicyServer:
         self.socket = self.context.socket(zmq.REP)
         self.socket.bind(f"tcp://{host}:{port}")
         self._endpoints: dict[str, EndpointHandler] = {}
+        # Logical get_action responses are cached at the policy/session boundary,
+        # before any retry can sample fresh noise or update policy memory.
+        self._request_cache: dict[tuple[Any, Any], tuple[dict, dict]] = {}
         self.api_token = api_token
 
         # Register the ping endpoint by default
         self.register_endpoint("ping", self._handle_ping, requires_input=False)
         self.register_endpoint("kill", self._kill_server, requires_input=False)
-        self.register_endpoint("get_action", self.policy.get_action)
-        self.register_endpoint("reset", self.policy.reset)
+        self.register_endpoint("get_action", self._handle_get_action)
+        self.register_endpoint("reset", self._handle_reset)
         self.register_endpoint(
             "get_modality_config",
             getattr(self.policy, "get_modality_config", lambda: {}),
+            requires_input=False,
+        )
+        self.register_endpoint(
+            "get_metadata",
+            getattr(self.policy, "get_metadata", lambda: {}),
+            requires_input=False,
+        )
+        self.register_endpoint(
+            "get_identity",
+            getattr(self.policy, "get_metadata", lambda: {}),
             requires_input=False,
         )
 
@@ -218,6 +233,79 @@ class PolicyServer:
         Simple ping handler that returns a success message.
         """
         return {"status": "ok", "message": "Server is running"}
+
+    def _uses_robott(self) -> bool:
+        """Return whether this server's policy stack contains a RoboTTT policy."""
+        policy = self.policy
+        seen: set[int] = set()
+        while policy is not None and id(policy) not in seen:
+            seen.add(id(policy))
+            if getattr(policy, "use_ttt", False) is True:
+                return True
+            policy = getattr(policy, "policy", None)
+        return False
+
+    @staticmethod
+    def _request_cache_key(options: dict[str, Any]) -> tuple[Any, Any] | None:
+        episode_id = options.get("episode_id")
+        request_id = options.get("request_id")
+        if episode_id is None or request_id is None:
+            return None
+        try:
+            hash((episode_id, request_id))
+        except TypeError as exc:
+            raise ValueError("episode_id and request_id must be hashable") from exc
+        return episode_id, request_id
+
+    @staticmethod
+    def _robott_memory_step(diagnostics: dict[str, Any]) -> int | None:
+        if diagnostics.get("memory_step") is not None:
+            return int(diagnostics["memory_step"])
+        ttt = diagnostics.get("ttt")
+        if not isinstance(ttt, list):
+            return None
+        steps = [item.get("memory_step") for item in ttt if isinstance(item, dict)]
+        steps = [int(step) for step in steps if step is not None]
+        return max(steps) if steps else None
+
+    def _handle_get_action(
+        self, observation: dict[str, Any], options: dict[str, Any] | None = None
+    ) -> tuple[dict, dict]:
+        """Echo request freshness metadata and make identified retries idempotent."""
+        request_options = dict(options or {})
+        cache_key = self._request_cache_key(request_options)
+        if cache_key is not None and cache_key in self._request_cache:
+            return copy.deepcopy(self._request_cache[cache_key])
+
+        action, diagnostics = self.policy.get_action(observation, options)
+        diagnostics = dict(diagnostics or {})
+        for field in self._FRESHNESS_FIELDS:
+            diagnostics[field] = request_options.get(field)
+
+        if self._uses_robott():
+            memory_step = self._robott_memory_step(diagnostics)
+            if memory_step is None:
+                raise RuntimeError("RoboTTT response missing memory_step diagnostics")
+            diagnostics["memory_step"] = memory_step
+
+        response = (action, diagnostics)
+        if cache_key is not None:
+            self._request_cache[cache_key] = copy.deepcopy(response)
+        return response
+
+    def _handle_reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
+        """Reset policy state, then discard every response from the prior session."""
+        reset_options = dict(options or {})
+        uses_robott = self._uses_robott()
+        if uses_robott:
+            # A wire-level reset is an episode boundary, not a memory-ablation
+            # control. Never report memory_step=0 while retaining TTT state.
+            reset_options["clear_memory"] = True
+        result = dict(self.policy.reset(reset_options) or {})
+        self._request_cache.clear()
+        if uses_robott:
+            result["memory_step"] = 0
+        return result
 
     def register_endpoint(self, name: str, handler: Callable, requires_input: bool = True):
         """
@@ -397,6 +485,12 @@ class PolicyClient(BasePolicy):
 
     def get_modality_config(self) -> dict[str, ModalityConfig]:
         return self.call_endpoint("get_modality_config", requires_input=False)
+
+    def get_metadata(self) -> dict[str, Any]:
+        return self.call_endpoint("get_metadata", requires_input=False)
+
+    def get_identity(self) -> dict[str, Any]:
+        return self.call_endpoint("get_identity", requires_input=False)
 
     def check_observation(self, observation: dict[str, Any]) -> None:
         raise NotImplementedError(

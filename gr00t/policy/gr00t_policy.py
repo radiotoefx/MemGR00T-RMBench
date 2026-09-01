@@ -20,16 +20,24 @@ This module provides the core policy classes for running Gr00t models:
 - Gr00tSimPolicyWrapper: Wrapper for compatibility with existing Gr00t simulation environments
 """
 
+import hashlib
+import json
 from pathlib import Path
+import secrets
 from typing import Any
 
 import numpy as np
 import torch
-from transformers import AutoModel, AutoProcessor
+from safetensors.torch import load_file
+from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from gr00t.data.embodiment_tags import FINETUNE_ONLY_TAGS, POSTTRAIN_TAGS, EmbodimentTag
 from gr00t.data.interfaces import BaseProcessor
 from gr00t.data.types import MessageType, ModalityConfig, VLAStepData
+from gr00t.utils.compact_checkpoint import (
+    resolve_compact_checkpoint_chain,
+    validate_finite_state_dict,
+)
 
 from .policy import BasePolicy, PolicyWrapper
 
@@ -67,6 +75,24 @@ def _sim_language_batch_to_sequence(value: Any) -> Any:
     return value
 
 
+def _sha256_file(path: str | Path | None) -> str | None:
+    if path is None:
+        return None
+    source = Path(path)
+    if not source.is_file():
+        return None
+    digest = hashlib.sha256()
+    with source.open("rb") as stream:
+        for chunk in iter(lambda: stream.read(8 * 1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def _canonical_json_sha256(value: Any) -> str:
+    payload = json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 class Gr00tPolicy(BasePolicy):
     """Core policy class for Gr00t model inference.
 
@@ -87,6 +113,12 @@ class Gr00tPolicy(BasePolicy):
         *,
         device: int | str,
         strict: bool = True,
+        model_config_overrides: dict[str, Any] | None = None,
+        base_model_path: str | None = None,
+        processor_path: str | None = None,
+        policy_seed: int | None = None,
+        noise_mode: str = "independent",
+        metadata: dict[str, Any] | None = None,
     ):
         """Initialize the Gr00t Policy.
 
@@ -96,6 +128,9 @@ class Gr00tPolicy(BasePolicy):
             model_path: Path to the pretrained model checkpoint directory
             device: Device to run the model on (e.g., 'cuda:0', 0, 'cpu')
             strict: Whether to enforce strict input validation (default: True)
+            processor_path: Optional checkpoint directory containing the processor.
+                This is useful for evaluating an unadapted base model with exactly
+                the same embodiment mapping and normalization as a finetuned model.
         """
         # Import this to register all models.
         import gr00t.model  # noqa: F401
@@ -104,25 +139,188 @@ class Gr00tPolicy(BasePolicy):
         if isinstance(embodiment_tag, str):
             embodiment_tag = EmbodimentTag.resolve(embodiment_tag)
         model_dir = Path(model_path)
+        compact_weights = model_dir / "trainable_model.safetensors"
+        compact_manifest = model_dir / "trainable_model.json"
 
         # Load the pretrained model and move to target device with bfloat16 precision
-        model = AutoModel.from_pretrained(model_dir)
+        model_config = None
+        checkpoint_load_report: list[dict[str, Any]] = []
+
+        def unpack_pretrained(result: Any) -> tuple[Any, dict[str, Any]]:
+            if isinstance(result, tuple) and len(result) == 2:
+                return result[0], dict(result[1])
+            return result, {}
+
+        def record_load(
+            *,
+            source: Path | str,
+            model: Any,
+            loading_info: dict[str, Any],
+            scope: str,
+            loaded_keys: list[str] | None = None,
+        ) -> None:
+            missing = sorted(loading_info.get("missing_keys", []))
+            unexpected = sorted(loading_info.get("unexpected_keys", []))
+            if loaded_keys is None:
+                loaded_keys = sorted(set(model.state_dict()) - set(missing))
+            report = {
+                "source": str(Path(source).resolve()),
+                "scope": scope,
+                "loaded": loaded_keys,
+                "missing": missing,
+                "unexpected": unexpected,
+            }
+            checkpoint_load_report.append(report)
+            print("Checkpoint load report: " + repr(report), flush=True)
+
+        if compact_weights.is_file():
+            if model_config_overrides:
+                raise ValueError(
+                    "Do not use model_config_overrides with a compact trainable checkpoint; "
+                    "its saved config defines the trained TTT architecture."
+                )
+            if not compact_manifest.is_file():
+                raise FileNotFoundError(
+                    f"Compact checkpoint is missing manifest: {compact_manifest}"
+                )
+            compact_base_path, delta_chain = resolve_compact_checkpoint_chain(model_dir)
+            compact_base_path = base_model_path or compact_base_path
+            if not compact_base_path:
+                raise ValueError(
+                    "Compact checkpoint does not identify a base model; pass base_model_path"
+                )
+            model_config = AutoConfig.from_pretrained(model_dir)
+            # Public N1.7 weights and policy execution are BF16. Constructing
+            # the 3B base in FP32 only to cast it after applying a compact delta
+            # doubles host traffic and made every offline probe spend minutes in
+            # CPU conversion. Loading directly in the production dtype is
+            # numerically equivalent to the former final ``model.to(bfloat16)``.
+            model, base_loading_info = unpack_pretrained(
+                AutoModel.from_pretrained(
+                    compact_base_path,
+                    config=model_config,
+                    dtype=torch.bfloat16,
+                    output_loading_info=True,
+                )
+            )
+            record_load(
+                source=compact_base_path,
+                model=model,
+                loading_info=base_loading_info,
+                scope="base_model",
+            )
+            for delta_dir in delta_chain:
+                delta = load_file(delta_dir / "trainable_model.safetensors", device="cpu")
+                validate_finite_state_dict(delta, source=str(delta_dir))
+                unexpected = sorted(set(delta) - set(model.state_dict()))
+                if unexpected:
+                    raise RuntimeError(
+                        f"Compact checkpoint {delta_dir} has {len(unexpected)} unknown "
+                        f"parameters: {unexpected}"
+                    )
+                load_result = model.load_state_dict(delta, strict=False)
+                record_load(
+                    source=delta_dir,
+                    model=model,
+                    loading_info={
+                        "missing_keys": load_result.missing_keys,
+                        "unexpected_keys": load_result.unexpected_keys,
+                    },
+                    scope="compact_delta",
+                    loaded_keys=sorted(delta),
+                )
+        elif model_config_overrides:
+            model_config = AutoConfig.from_pretrained(model_dir)
+            unknown = [key for key in model_config_overrides if not hasattr(model_config, key)]
+            if unknown:
+                raise ValueError(f"Unknown model config override(s): {unknown}")
+            for key, value in model_config_overrides.items():
+                setattr(model_config, key, value)
+        if compact_weights.is_file():
+            pass
+        elif model_config_overrides:
+            model, loading_info = unpack_pretrained(
+                AutoModel.from_pretrained(
+                    model_dir, config=model_config, output_loading_info=True
+                )
+            )
+            record_load(
+                source=model_dir,
+                model=model,
+                loading_info=loading_info,
+                scope="full_checkpoint_with_overrides",
+            )
+            ttt_missing = [
+                key
+                for key in loading_info.get("missing_keys", [])
+                if ".ttt." in key or key.endswith("register_tokens")
+            ]
+            # Only a vanilla -> TTT architecture expansion needs initialization.
+            # Never overwrite TTT tensors that were loaded from a trained checkpoint.
+            if model_config_overrides.get("use_ttt", False) and ttt_missing:
+                model.action_head.initialize_ttt_parameters()
+        else:
+            model, loading_info = unpack_pretrained(
+                AutoModel.from_pretrained(model_dir, output_loading_info=True)
+            )
+            record_load(
+                source=model_dir,
+                model=model,
+                loading_info=loading_info,
+                scope="full_checkpoint",
+            )
         model.eval()  # Set model to evaluation mode
         model.to(device=device, dtype=torch.bfloat16)
         self.model = model
+        self.use_ttt = getattr(getattr(model, "config", None), "use_ttt", False) is True
+        self.checkpoint_load_report = checkpoint_load_report
+
+        if noise_mode not in {"independent", "episode_common"}:
+            raise ValueError(
+                "noise_mode must be 'independent' or 'episode_common', "
+                f"got {noise_mode!r}"
+            )
+        if policy_seed is None:
+            policy_seed = secrets.randbits(63)
+        if isinstance(policy_seed, bool) or not isinstance(policy_seed, (int, np.integer)):
+            raise TypeError("policy_seed must be an integer")
+        if int(policy_seed) < 0:
+            raise ValueError("policy_seed must be non-negative")
+        self.noise_mode = noise_mode
+        self.policy_seed = int(policy_seed)
+        self._policy_cpu_generator = torch.Generator(device="cpu")
+        self._policy_device_generator = torch.Generator(device=self.model.device)
+        self._reseed_policy_generators(self.policy_seed)
+        self._noise_episode = -1
+        self._noise_query = 0
+        self._episode_noise: torch.Tensor | None = None
+        self._current_noise_id = ""
+        self._metadata = dict(metadata or {})
+        self._begin_noise_episode()
 
         # Load the processor for input/output transformation.
         # Training saves processor files under a "processor/" subdirectory, but
         # AutoProcessor expects them at the model root.  Fall back to the
         # subdirectory when the root lacks a processor_config.json.
+        processor_model_dir = Path(processor_path) if processor_path else model_dir
         processor_dir = (
-            model_dir / "processor"
-            if (model_dir / "processor").is_dir()
-            and not (model_dir / "processor_config.json").exists()
-            else model_dir
+            processor_model_dir / "processor"
+            if (processor_model_dir / "processor").is_dir()
+            and not (processor_model_dir / "processor_config.json").exists()
+            else processor_model_dir
         )
         self.processor: BaseProcessor = AutoProcessor.from_pretrained(processor_dir)
         self.processor.eval()
+        statistics_path = self._metadata.get("statistics_path")
+        if statistics_path is not None:
+            with Path(statistics_path).open("r") as stream:
+                source_statistics = json.load(stream)
+            self._metadata["stats_source_content_sha256"] = _canonical_json_sha256(
+                source_statistics
+            )
+            self._metadata["stats_runtime_content_sha256"] = _canonical_json_sha256(
+                self.processor.state_action_processor.statistics
+            )
 
         # Store embodiment-specific configurations
         self.embodiment_tag = embodiment_tag
@@ -413,9 +611,30 @@ class Gr00tPolicy(BasePolicy):
         collated_inputs = _rec_to_dtype(collated_inputs, dtype=torch.bfloat16)
 
         # Step 4: Run model inference to predict actions
-        with torch.inference_mode():
-            model_pred = self.model.get_action(**collated_inputs)
+        # inference_mode cannot be locally re-enabled for the real inner
+        # gradient required by TTT. no_grad can, and RoboTTTLayer does so only
+        # around its small fast model.
+        inference_context = torch.no_grad() if self.use_ttt else torch.inference_mode()
+        with inference_context:
+            model_options = dict(options or {})
+            model_options["generator"] = self._policy_device_generator
+            noise_id = self._claim_noise_id()
+            if self.noise_mode == "episode_common" and self._episode_noise is not None:
+                model_options["initial_noise"] = self._episode_noise
+            model_pred = self.model.get_action(**collated_inputs, options=model_options)
+            if self.noise_mode == "episode_common" and self._episode_noise is None:
+                initial_noise = model_pred.get("initial_noise")
+                if initial_noise is None:
+                    raise RuntimeError(
+                        "episode_common requires the model to return its initial_noise"
+                    )
+                self._episode_noise = initial_noise.detach().clone()
         normalized_action = model_pred["action_pred"].float()
+        ttt_diagnostics = self.model.ttt_diagnostics() if self.use_ttt else None
+        if not torch.isfinite(normalized_action).all():
+            raise FloatingPointError(
+                f"Policy produced non-finite normalized actions; TTT diagnostics: {ttt_diagnostics}"
+            )
 
         # Step 5: Decode actions from normalized space back to physical units
         batched_states = {}
@@ -429,7 +648,116 @@ class Gr00tPolicy(BasePolicy):
         casted_action = {
             key: value.astype(np.float32) for key, value in unnormalized_action.items()
         }
-        return casted_action, {}
+        action_diagnostics: dict[str, Any] = {}
+        offset = 0
+        action_params = self.processor.state_action_processor.norm_params[
+            self.embodiment_tag.value
+        ]["action"]
+        for key in self.modality_configs["action"].modality_keys:
+            dimension = int(action_params[key]["dim"].item())
+            group = normalized_action[..., offset : offset + dimension]
+            group_abs = group.abs()
+            decoded_group = casted_action[key]
+            group_metrics: dict[str, Any] = {
+                "normalized_out_of_range_fraction": float((group_abs > 1.0).float().mean()),
+                "normalized_boundary_fraction": float((group_abs >= 0.999).float().mean()),
+                "normalized_abs_p95": float(torch.quantile(group_abs, 0.95)),
+                "normalized_abs_max": float(group_abs.max()),
+                # Preserve the signed, pre-decode first action.  Aggregate OOR
+                # rates cannot distinguish a small persistent bias from
+                # normalization clipping, which is essential for diagnosing
+                # relative-action drift in closed loop.
+                "normalized_first_action": group[:, 0].detach().cpu().tolist(),
+                "normalized_first_action_clipped": (
+                    group[:, 0].clamp(-1.0, 1.0).detach().cpu().tolist()
+                ),
+                "normalized_first_clip_abs_delta_max": float(
+                    (group[:, 0] - group[:, 0].clamp(-1.0, 1.0)).abs().max()
+                ),
+            }
+            if decoded_group.shape[-2] > 1:
+                adjacent = np.abs(np.diff(decoded_group, axis=-2))
+                group_metrics.update(
+                    {
+                        "decoded_adjacent_abs_mean": float(adjacent.mean()),
+                        "decoded_adjacent_abs_p95": float(np.quantile(adjacent, 0.95)),
+                        "decoded_adjacent_abs_max": float(adjacent.max()),
+                    }
+                )
+                if "gripper" in key:
+                    binary = (decoded_group >= 0.5).astype(np.int8)
+                    group_metrics["decoded_binary_flip_count"] = float(
+                        np.count_nonzero(np.diff(binary, axis=-2))
+                    )
+            if key in batched_states:
+                current = batched_states[key][:, -1]
+                signed_first_delta = decoded_group[:, 0] - current
+                first_delta = np.abs(signed_first_delta)
+                group_metrics["decoded_first_state_delta_mean"] = float(first_delta.mean())
+                group_metrics["decoded_first_state_delta_max"] = float(first_delta.max())
+                # Request-level provenance for diagnosing slow relative-action drift.
+                # Lists are intentionally limited to the first action and current
+                # state, so the wire/log overhead stays tiny even for long chunks.
+                group_metrics["reference_state"] = current.tolist()
+                group_metrics["decoded_first_target"] = decoded_group[:, 0].tolist()
+                group_metrics["decoded_first_state_delta_signed"] = (
+                    signed_first_delta.tolist()
+                )
+
+                state_params = self.processor.state_action_processor.norm_params[
+                    self.embodiment_tag.value
+                ]["state"].get(key)
+                if state_params is not None and {"min", "max"} <= set(state_params):
+                    state_min = np.asarray(state_params["min"])
+                    state_max = np.asarray(state_params["max"])
+                    state_range = np.maximum(state_max - state_min, 1e-8)
+                    preclip_normalized = 2.0 * (current - state_min) / state_range - 1.0
+                    preclip_oor = np.abs(preclip_normalized) > 1.0
+                    group_metrics["state_preclip_out_of_range_fraction"] = float(
+                        np.mean(preclip_oor)
+                    )
+                    group_metrics["state_preclip_normalized_abs_max"] = float(
+                        np.max(np.abs(preclip_normalized))
+                    )
+                    # Twelve joints are cheap to send and make the first OOR
+                    # event attributable to a concrete joint instead of only
+                    # exposing an aggregate fraction/max.
+                    group_metrics["state_preclip_normalized"] = preclip_normalized.tolist()
+                    group_metrics["state_preclip_out_of_range_mask"] = preclip_oor.tolist()
+                    group_metrics["state_normalization_lower"] = state_min.tolist()
+                    group_metrics["state_normalization_upper"] = state_max.tolist()
+                    # Backward-compatible aliases.  With use_percentiles=True
+                    # these are q01/q99 normalization bounds, not raw extrema.
+                    group_metrics["state_training_min"] = state_min.tolist()
+                    group_metrics["state_training_max"] = state_max.tolist()
+                    raw_state_stats = self.processor.state_action_processor.statistics[
+                        self.embodiment_tag.value
+                    ]["state"].get(key)
+                    if raw_state_stats is not None and {"min", "max"} <= set(
+                        raw_state_stats
+                    ):
+                        observed_min = np.asarray(raw_state_stats["min"])
+                        observed_max = np.asarray(raw_state_stats["max"])
+                        observed_oor = (current < observed_min) | (current > observed_max)
+                        group_metrics["state_observed_min"] = observed_min.tolist()
+                        group_metrics["state_observed_max"] = observed_max.tolist()
+                        group_metrics["state_observed_out_of_range_mask"] = (
+                            observed_oor.tolist()
+                        )
+                        group_metrics["state_observed_out_of_range_fraction"] = float(
+                            np.mean(observed_oor)
+                        )
+            action_diagnostics[key] = group_metrics
+            offset += dimension
+
+        info: dict[str, Any] = {
+            "action_diagnostics": action_diagnostics,
+            "noise_id": noise_id,
+            "noise_mode": self.noise_mode,
+        }
+        if ttt_diagnostics is not None:
+            info["ttt"] = ttt_diagnostics
+        return casted_action, info
 
     def check_action(self, action: dict[str, Any]) -> None:
         """Validate that the action has the correct structure and types.
@@ -479,6 +807,115 @@ class Gr00tPolicy(BasePolicy):
     def get_modality_config(self) -> dict[str, ModalityConfig]:
         return self.modality_configs
 
+    def _reseed_policy_generators(self, seed: int) -> None:
+        self._policy_cpu_generator.manual_seed(seed)
+        self._policy_device_generator.manual_seed(seed)
+
+    def _new_noise_id(self, query: int | str) -> str:
+        nonce = int(
+            torch.randint(
+                0,
+                torch.iinfo(torch.int64).max,
+                (),
+                generator=self._policy_cpu_generator,
+                dtype=torch.int64,
+            ).item()
+        )
+        identity = f"{self.policy_seed}:{query}:{nonce}"
+        return "noise-" + hashlib.sha256(identity.encode("ascii")).hexdigest()[:20]
+
+    def _begin_noise_episode(self) -> None:
+        self._noise_episode += 1
+        self._noise_query = 0
+        self._episode_noise = None
+        query: int | str = "common" if self.noise_mode == "episode_common" else 0
+        self._current_noise_id = self._new_noise_id(query)
+
+    def _claim_noise_id(self) -> str:
+        noise_id = self._current_noise_id
+        if self.noise_mode == "independent":
+            self._noise_query += 1
+            self._current_noise_id = self._new_noise_id(self._noise_query)
+        return noise_id
+
+    def get_metadata(self) -> dict[str, Any]:
+        metadata = dict(self._metadata)
+        metadata.update(
+            {
+                "schema": "rmbench_gr00t_server_v1",
+                "policy_kind": "robottt" if self.use_ttt else "vanilla",
+                "policy_type": "robottt" if self.use_ttt else "vanilla",
+                "noise_mode": self.noise_mode,
+                "memory_enabled": self.use_ttt,
+                "memory_impl_version": "robottt_v1" if self.use_ttt else None,
+                "policy_seed": self.policy_seed,
+                "checkpoint_load_report": self.checkpoint_load_report,
+            }
+        )
+        required = (
+            "policy_type",
+            "adapter_version",
+            "repo_commit",
+            "checkpoint_sha256",
+            "processor_sha256",
+            "stats_sha256",
+            "statistics_sha256",
+            "modality_config_sha256",
+            "state_arm_semantics",
+            "state_gripper_semantics",
+            "arm_action_semantics",
+            "gripper_action_semantics",
+            "ppu_id",
+        )
+        blockers = [f"missing:{key}" for key in required if metadata.get(key) is None]
+        for source, path_key, digest_key in (
+            ("checkpoint", "checkpoint_path", "checkpoint_sha256"),
+            ("processor", "processor_path", "processor_sha256"),
+            ("stats", "statistics_path", "stats_sha256"),
+        ):
+            current_digest = _sha256_file(metadata.get(path_key))
+            metadata[f"{source}_current_sha256"] = current_digest
+            if current_digest != metadata.get(digest_key):
+                blockers.append(f"{source}_source_changed_after_load")
+        if metadata.get("stats_source_content_sha256") != metadata.get(
+            "stats_runtime_content_sha256"
+        ):
+            blockers.append("stats_runtime_content_mismatch")
+        if metadata.get("dirty") is not False:
+            blockers.append("repo_not_clean")
+        if metadata.get("adapter_version") == "gr00t_policy_adapter_v4":
+            expected_adapter_semantics = {
+                "state_arm_semantics": "actual_qpos",
+                "state_gripper_semantics": "physical",
+                "arm_action_semantics": "absolute",
+                "gripper_action_semantics": "absolute",
+                "processor_decode_output_semantics": "absolute",
+                "boundary_conversion": "none",
+                "decoded_absolute_action_boundary": True,
+            }
+            blockers.extend(
+                f"adapter_v4_semantic_mismatch:{key}"
+                for key, expected in expected_adapter_semantics.items()
+                if metadata.get(key) != expected
+            )
+        if metadata.get("policy_seed_explicit") is not True:
+            blockers.append("policy_seed_not_explicit")
+        if not self.checkpoint_load_report:
+            blockers.append("checkpoint_load_report_empty")
+        for report in self.checkpoint_load_report:
+            scope = report.get("scope", "unknown")
+            if not report.get("loaded"):
+                blockers.append(f"checkpoint_loaded_keys_empty:{scope}")
+            if report.get("unexpected"):
+                blockers.append(f"checkpoint_unexpected_keys:{scope}")
+            if scope != "compact_delta" and report.get("missing"):
+                blockers.append(f"checkpoint_missing_keys:{scope}")
+        if self.use_ttt and metadata.get("parent_checkpoint_sha256") is None:
+            blockers.append("missing:parent_checkpoint_sha256")
+        metadata["formal_blockers"] = sorted(blockers)
+        metadata["formal_eligible"] = not blockers
+        return metadata
+
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         """Reset the policy to its initial state.
 
@@ -488,7 +925,37 @@ class Gr00tPolicy(BasePolicy):
         Returns:
             Dictionary containing the info after resetting the policy
         """
-        return {}
+        options = dict(options or {})
+        seed = options.get("seed")
+        if seed is not None:
+            if isinstance(seed, bool) or not isinstance(seed, (int, np.integer)):
+                raise TypeError(f"reset seed must be an integer, got {type(seed).__name__}")
+            seed = int(seed)
+            if seed < 0:
+                raise ValueError(f"reset seed must be non-negative, got {seed}")
+        rng_reseeded = bool(options.get("reseed_rng", seed is not None))
+        if rng_reseeded:
+            if seed is not None:
+                self.policy_seed = seed
+            self._reseed_policy_generators(self.policy_seed)
+
+        clear_memory = bool(options.get("clear_memory", True))
+        reset_ttt_state = getattr(self.model, "reset_ttt_state", None)
+        memory_cleared = bool(clear_memory and self.use_ttt and reset_ttt_state is not None)
+        if memory_cleared:
+            reset_ttt_state()
+
+        # A seed-bearing reset marks an episode boundary. Memory-only ablations
+        # call reset() without options and must preserve episode-common noise.
+        if bool(options.get("reset_noise", seed is not None)):
+            self._begin_noise_episode()
+        return {
+            "memory_cleared": memory_cleared,
+            "rng_reseeded": rng_reseeded,
+            "policy_seed": self.policy_seed,
+            "noise_mode": self.noise_mode,
+            "noise_id": self._current_noise_id,
+        }
 
 
 class Gr00tSimPolicyWrapper(PolicyWrapper):

@@ -130,3 +130,6 @@ class PolicyWrapper(BasePolicy):
 
     def reset(self, options: dict[str, Any] | None = None) -> dict[str, Any]:
         return self.policy.reset(options)
+
+    def get_metadata(self) -> dict[str, Any]:
+        return getattr(self.policy, "get_metadata", lambda: {})()

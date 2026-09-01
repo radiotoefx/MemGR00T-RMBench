@@ -1,12 +1,22 @@
 # Default platform pyproject.toml (x86, GB200, and any non-Jetson GPU)
 
 [build-system]
-requires = ["setuptools>=67", "wheel", "pip"]
+requires = ["setuptools>=77", "wheel", "pip"]
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "gr00t"
 version = "0.1.0"
+description = "MemGR00T-RMBench: an independent GR00T N1.7 derivative with episode-local fast memory"
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE", "NOTICE"]
+maintainers = [{ name = "radiotoefx" }]
+keywords = ["robotics", "vision-language-action", "GR00T", "RoboTTT", "RMBench"]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Programming Language :: Python :: 3.12",
+]
 requires-python = ">=3.12,<3.13"
 dependencies = [
     "albumentations==1.4.18",
@@ -57,6 +67,12 @@ dependencies = [
     "tensorrt-cu12-libs>=10.15.1.29; platform_machine == 'x86_64'",
     "tensorrt-cu13-libs>=10.15.1.29; platform_machine == 'aarch64'",
 ]
+
+[project.urls]
+Homepage = "https://github.com/radiotoefx/MemGR00T-RMBench"
+Repository = "https://github.com/radiotoefx/MemGR00T-RMBench.git"
+Issues = "https://github.com/radiotoefx/MemGR00T-RMBench/issues"
+Documentation = "https://github.com/radiotoefx/MemGR00T-RMBench/tree/main/docs"
 
 [project.optional-dependencies]
 dev = [

@@ -96,7 +96,7 @@ The N1.6 runs used 10 trials per task. The N1.7 release run above used 40 trials
 Set up Isaac-GR00T and RoboLab in separate environments. First, install Isaac-GR00T for the policy server. See the main [environment setup guide](../../README.md#set-up-the-environment) for platform-specific system requirements:
 
 ```bash
-git clone --recurse-submodules https://github.com/NVIDIA/Isaac-GR00T.git
+git clone --recurse-submodules https://github.com/radiotoefx/MemGR00T-RMBench.git
 cd Isaac-GR00T
 curl -LsSf https://astral.sh/uv/install.sh | sh
 uv sync --python 3.12

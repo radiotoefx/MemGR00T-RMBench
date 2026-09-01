@@ -152,6 +152,76 @@ class TestActionHeadGetAction:
         )
         assert out["action_pred"].shape[0] == 1
 
+    def test_get_action_accepts_explicit_initial_noise(self, action_head):
+        head, config = action_head
+        backbone = _make_backbone_output(config, batch_size=1)
+        action_input = _make_action_input(config, batch_size=1)
+        del action_input["action"]
+        initial_noise = torch.randn(1, config.action_horizon, config.max_action_dim)
+
+        out = head.get_action(
+            backbone,
+            action_input,
+            options={"initial_noise": initial_noise},
+        )
+
+        torch.testing.assert_close(out["initial_noise"], initial_noise)
+
+    def test_get_action_private_generator_does_not_advance_global_rng(self, action_head):
+        head, config = action_head
+        backbone = _make_backbone_output(config, batch_size=1)
+        action_input = _make_action_input(config, batch_size=1)
+        del action_input["action"]
+        generator = torch.Generator(device="cpu").manual_seed(123)
+        global_state = torch.random.get_rng_state().clone()
+
+        head.get_action(backbone, action_input, options={"generator": generator})
+
+        torch.testing.assert_close(torch.random.get_rng_state(), global_state)
+
+    def test_ttt_update_only_matches_full_denoising_fast_state(self):
+        config = _small_config(
+            use_ttt=True,
+            ttt_num_layers=1,
+            ttt_dim=8,
+            ttt_hidden_dim=16,
+            ttt_update_during_rollout=True,
+        )
+        head = Gr00tN1d7ActionHead(config).eval()
+        backbone = _make_backbone_output(config, batch_size=1)
+        action_input = _make_action_input(config, batch_size=1)
+        del action_input["action"]
+
+        torch.manual_seed(123)
+        head.reset_ttt_state(batch_size=1)
+        head.get_action(backbone, action_input)
+        full_state = [
+            tuple(tensor.detach().clone() for tensor in layer.fast_state.tensors())
+            for layer in head.model.ttt_layers()
+        ]
+
+        torch.manual_seed(123)
+        head.reset_ttt_state(batch_size=1)
+        head.get_action(
+            backbone,
+            action_input,
+            options={"ttt_state_update_only": True},
+        )
+        update_only_state = [
+            tuple(tensor.detach().clone() for tensor in layer.fast_state.tensors())
+            for layer in head.model.ttt_layers()
+        ]
+
+        assert len(full_state) == len(update_only_state) == 1
+        for full_layer, update_only_layer in zip(full_state, update_only_state):
+            for full_tensor, update_only_tensor in zip(full_layer, update_only_layer):
+                # Both paths execute the same first forward. PPU attention
+                # kernels are not bitwise deterministic across repeated calls,
+                # so admit only the observed floating-point scheduling noise.
+                torch.testing.assert_close(
+                    full_tensor, update_only_tensor, rtol=1e-4, atol=1e-7
+                )
+
 
 class TestActionHeadEncodeFeatures:
     """Test feature encoding helper."""

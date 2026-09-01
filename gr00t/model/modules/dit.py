@@ -25,6 +25,8 @@ import torch
 from torch import nn
 import torch.nn.functional as F
 
+from gr00t.model.modules.robottt import RoboTTTLayer
+
 
 def _is_spark_sm121() -> bool:
     if not torch.cuda.is_available():
@@ -118,6 +120,7 @@ class BasicTransformerBlock(nn.Module):
         ff_inner_dim: Optional[int] = None,
         ff_bias: bool = True,
         attention_out_bias: bool = True,
+        ttt_config: Optional[dict] = None,
     ):
         super().__init__()
         self.dim = dim
@@ -131,6 +134,20 @@ class BasicTransformerBlock(nn.Module):
         self.positional_embeddings = positional_embeddings
         self.num_positional_embeddings = num_positional_embeddings
         self.norm_type = norm_type
+
+        ttt_config = ttt_config or {}
+        self.ttt = (
+            RoboTTTLayer(
+                dim,
+                ttt_dim=ttt_config.get("dim", 256),
+                fast_hidden_dim=ttt_config.get("hidden_dim", 1024),
+                base_lr=ttt_config.get("base_lr", 0.1),
+                gate_init=ttt_config.get("gate_init", 0.001),
+                norm_eps=norm_eps,
+            )
+            if ttt_config.get("enabled", False)
+            else None
+        )
 
         if positional_embeddings and (num_positional_embeddings is None):
             raise ValueError(
@@ -184,6 +201,7 @@ class BasicTransformerBlock(nn.Module):
         encoder_hidden_states: Optional[torch.Tensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         temb: Optional[torch.LongTensor] = None,
+        ttt_update_enabled: bool = True,
     ) -> torch.Tensor:
         # 0. Self-Attention
         if self.norm_type == "ada_norm":
@@ -208,6 +226,9 @@ class BasicTransformerBlock(nn.Module):
         hidden_states = attn_output + hidden_states
         if hidden_states.ndim == 4:
             hidden_states = hidden_states.squeeze(1)
+
+        if self.ttt is not None:
+            hidden_states = self.ttt(hidden_states, update_state=ttt_update_enabled)
 
         # 4. Feed-forward
         norm_hidden_states = self.norm3(hidden_states)
@@ -243,6 +264,7 @@ class DiT(ModelMixin, ConfigMixin):
         positional_embeddings: Optional[str] = "sinusoidal",
         interleave_self_attention=False,
         cross_attention_dim: Optional[int] = None,
+        ttt_config: Optional[dict] = None,
     ):
         super().__init__()
 
@@ -256,9 +278,20 @@ class DiT(ModelMixin, ConfigMixin):
         )
 
         all_blocks = []
+        configured_ttt_layers = None
+        if ttt_config and ttt_config.get("layer_indices") is not None:
+            configured_ttt_layers = set(ttt_config["layer_indices"])
+        elif ttt_config and ttt_config.get("num_layers") is not None:
+            count = min(int(ttt_config["num_layers"]), self.config.num_layers)
+            configured_ttt_layers = set(range(self.config.num_layers - count, self.config.num_layers))
         for idx in range(self.config.num_layers):
             use_self_attn = idx % 2 == 1 and interleave_self_attention
             curr_cross_attention_dim = cross_attention_dim if not use_self_attn else None
+            block_ttt_config = dict(ttt_config or {})
+            block_ttt_config["enabled"] = bool(
+                block_ttt_config.get("enabled", False)
+                and (configured_ttt_layers is None or idx in configured_ttt_layers)
+            )
 
             all_blocks += [
                 BasicTransformerBlock(
@@ -276,6 +309,7 @@ class DiT(ModelMixin, ConfigMixin):
                     num_positional_embeddings=self.config.max_num_positional_embeddings,
                     final_dropout=final_dropout,
                     cross_attention_dim=curr_cross_attention_dim,
+                    ttt_config=block_ttt_config,
                 )
             ]
         self.transformer_blocks = nn.ModuleList(all_blocks)
@@ -289,6 +323,36 @@ class DiT(ModelMixin, ConfigMixin):
             sum(p.numel() for p in self.parameters() if p.requires_grad),
         )
 
+    def ttt_layers(self):
+        return [block.ttt for block in self.transformer_blocks if block.ttt is not None]
+
+    def reset_ttt_state(self, batch_size: int | None = None) -> None:
+        for layer in self.ttt_layers():
+            layer.reset_state(batch_size)
+
+    def detach_ttt_state(self) -> None:
+        for layer in self.ttt_layers():
+            layer.detach_state()
+
+    def ttt_diagnostics(self) -> list[dict[str, float | int]]:
+        return [
+            {
+                "memory_step": layer.state_step,
+                "residual_norm": layer.last_effective_residual_norm,
+                "nonzero_fraction": layer.last_effective_nonzero_fraction,
+                # Compatibility aliases for existing offline analysis scripts.
+                "step": layer.state_step,
+                "update_norm": layer.last_update_norm,
+                "gate_mean_abs": float(torch.tanh(layer.gate).detach().abs().mean().cpu()),
+                "ttt_output_norm": layer.last_ttt_output_norm,
+                "gated_residual_norm": layer.last_gated_residual_norm,
+                "effective_residual_norm": layer.last_effective_residual_norm,
+                "effective_residual_fraction": layer.last_effective_residual_fraction,
+                "effective_nonzero_fraction": layer.last_effective_nonzero_fraction,
+            }
+            for layer in self.ttt_layers()
+        ]
+
     def forward(
         self,
         hidden_states: torch.Tensor,  # Shape: (B, T, D)
@@ -296,6 +360,7 @@ class DiT(ModelMixin, ConfigMixin):
         timestep: Optional[torch.LongTensor] = None,
         encoder_attention_mask: Optional[torch.Tensor] = None,
         return_all_hidden_states: bool = False,
+        ttt_update_enabled: bool = True,
     ):
         # Encode timesteps
         temb = self.timestep_encoder(timestep)
@@ -315,6 +380,7 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    ttt_update_enabled=ttt_update_enabled,
                 )
             else:
                 hidden_states = block(
@@ -323,6 +389,7 @@ class DiT(ModelMixin, ConfigMixin):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=None,
                     temb=temb,
+                    ttt_update_enabled=ttt_update_enabled,
                 )
             all_hidden_states.append(hidden_states)
 
@@ -355,6 +422,7 @@ class AlternateVLDiT(DiT):
         return_all_hidden_states: bool = False,
         image_mask: Optional[torch.Tensor] = None,
         backbone_attention_mask: Optional[torch.Tensor] = None,
+        ttt_update_enabled: bool = True,
     ):
         assert image_mask is not None, "Image mask is required"
 
@@ -385,6 +453,7 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=None,
                     encoder_attention_mask=None,
                     temb=temb,
+                    ttt_update_enabled=ttt_update_enabled,
                 )
             else:
                 # Cross-attention blocks - alternate between non-image and image tokens
@@ -401,6 +470,7 @@ class AlternateVLDiT(DiT):
                     encoder_hidden_states=encoder_hidden_states,
                     encoder_attention_mask=curr_encoder_attention_mask,
                     temb=temb,
+                    ttt_update_enabled=ttt_update_enabled,
                 )
             all_hidden_states.append(hidden_states)
 

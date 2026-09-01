@@ -1,0 +1,21 @@
+MemGR00T-RMBench
+Copyright 2026 radiotoefx
+
+This project is a derivative work based on NVIDIA Isaac GR00T N1.7:
+https://github.com/NVIDIA/Isaac-GR00T
+
+The upstream source is Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES and
+is distributed under the Apache License, Version 2.0. The original LICENSE and
+copyright notices are retained. Modifications made for this project include a
+lightweight RoboTTT-style fast-memory mechanism, ordered sequence training,
+RMBench data/deployment configuration, auditable policy-server semantics, and
+associated tests and documentation. Git history identifies the modified files
+and changes.
+
+MemGR00T-RMBench is maintained independently. It is not an NVIDIA product and
+is not affiliated with or endorsed by NVIDIA. NVIDIA and Isaac are trademarks
+of NVIDIA Corporation; their names are used only to identify the upstream work.
+
+The term RoboTTT is used descriptively to identify the research idea that
+inspired the fast-memory adapter. This repository does not claim an official or
+parameter-for-parameter reproduction of the original RoboTTT implementation.

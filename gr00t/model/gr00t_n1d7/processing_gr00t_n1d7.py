@@ -171,6 +171,20 @@ class Gr00tN1d7DataCollator:
         self.model_name = model_name
 
     def __call__(self, features: list[Dict[str, Any]]) -> BatchFeature:
+        sequence_flags = ["robottt_sequence" in feature for feature in features]
+        if any(sequence_flags):
+            if not all(sequence_flags):
+                raise ValueError("Cannot mix RoboTTT sequences and single steps in one batch")
+            lengths = {len(feature["robottt_sequence"]) for feature in features}
+            if len(lengths) != 1:
+                raise ValueError(f"RoboTTT sequences must have equal length, got {sorted(lengths)}")
+            sequence_length = lengths.pop()
+            time_batches = []
+            for timestep in range(sequence_length):
+                timestep_features = [feature["robottt_sequence"][timestep] for feature in features]
+                time_batches.append(self(timestep_features)["inputs"])
+            return BatchFeature(data={"inputs": {"robottt_sequence": time_batches}})
+
         batch = {}
         keys = list(set().union(*(elem.keys() for elem in features)))
 
@@ -219,6 +233,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         modality_configs: dict[str, dict[str, ModalityConfig]],
         statistics: (dict[str, dict[str, dict[str, dict[str, list[float]]]]] | None) = None,
         use_percentiles: bool = False,
+        use_relative_action_percentiles: bool = False,
         clip_outliers: bool = True,
         image_crop_size: list[int] = None,
         image_target_size: list[int] = None,
@@ -252,6 +267,7 @@ class Gr00tN1d7Processor(BaseProcessor):
             modality_configs=modality_configs,
             statistics=statistics,
             use_percentiles=use_percentiles,
+            use_relative_action_percentiles=use_relative_action_percentiles,
             clip_outliers=clip_outliers,
             apply_sincos_state_encoding=apply_sincos_state_encoding,
             use_relative_action=use_relative_action,
@@ -259,6 +275,7 @@ class Gr00tN1d7Processor(BaseProcessor):
 
         # Save state action processor settings
         self.use_percentiles = use_percentiles
+        self.use_relative_action_percentiles = use_relative_action_percentiles
         self.use_mean_std = use_mean_std
         self.clip_outliers = clip_outliers
         self.apply_sincos_state_encoding = apply_sincos_state_encoding
@@ -781,6 +798,7 @@ class Gr00tN1d7Processor(BaseProcessor):
                 "max_action_horizon": self.max_action_horizon,
                 # StateActionProcessor settings
                 "use_percentiles": self.use_percentiles,
+                "use_relative_action_percentiles": self.use_relative_action_percentiles,
                 "use_mean_std": self.use_mean_std,
                 "clip_outliers": self.clip_outliers,
                 "apply_sincos_state_encoding": self.apply_sincos_state_encoding,
@@ -858,6 +876,7 @@ class Gr00tN1d7Processor(BaseProcessor):
         processor_kwargs.setdefault("model_name", "nvidia/Cosmos-Reason2-2B")
         processor_kwargs.setdefault("model_type", "qwen")
         processor_kwargs.setdefault("clip_outliers", True)
+        processor_kwargs.setdefault("use_relative_action_percentiles", False)
 
         # Directly override other processor kwargs
         if kwargs:
@@ -866,6 +885,8 @@ class Gr00tN1d7Processor(BaseProcessor):
             for embodiment_tag, modality_config in modality_configs.items():
                 processor_kwargs["modality_configs"][embodiment_tag] = modality_config
             override_keys = [
+                "use_percentiles",
+                "use_relative_action_percentiles",
                 "random_rotation_angle",
                 "color_jitter_params",
                 "use_relative_action",

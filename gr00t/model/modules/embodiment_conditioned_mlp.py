@@ -78,6 +78,17 @@ class CategorySpecificLinear(nn.Module):
         selected_b = self.b[cat_ids]
         return torch.bmm(x, selected_W) + selected_b.unsqueeze(1)
 
+    @torch.no_grad()
+    def copy_category_(self, source_id: int, target_id: int) -> None:
+        """Warm-start one otherwise independent embodiment slot from another."""
+        for category_id, label in ((source_id, "source"), (target_id, "target")):
+            if not 0 <= category_id < self.num_categories:
+                raise ValueError(
+                    f"{label}_id={category_id} is outside [0, {self.num_categories})"
+                )
+        self.W[target_id].copy_(self.W[source_id])
+        self.b[target_id].copy_(self.b[source_id])
+
     def expand_action_dimension(
         self, old_action_dim, new_action_dim, expand_input=False, expand_output=False
     ):
@@ -160,6 +171,10 @@ class CategorySpecificMLP(nn.Module):
         hidden = F.relu(self.layer1(x, cat_ids))
         return self.layer2(hidden, cat_ids)
 
+    def copy_category_(self, source_id: int, target_id: int) -> None:
+        self.layer1.copy_category_(source_id, target_id)
+        self.layer2.copy_category_(source_id, target_id)
+
     def expand_action_dimension(self, old_action_dim, new_action_dim):
         """
         Expand action dimension by copying weights from existing dimensions.
@@ -223,6 +238,11 @@ class MultiEmbodimentActionEncoder(nn.Module):
         # 5) Finally W3 => (B, T, w)
         x = self.W3(x, cat_ids)
         return x
+
+    def copy_category_(self, source_id: int, target_id: int) -> None:
+        self.W1.copy_category_(source_id, target_id)
+        self.W2.copy_category_(source_id, target_id)
+        self.W3.copy_category_(source_id, target_id)
 
     def expand_action_dimension(self, old_action_dim, new_action_dim):
         """

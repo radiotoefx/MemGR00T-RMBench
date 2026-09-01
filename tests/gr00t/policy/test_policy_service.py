@@ -37,11 +37,13 @@ class MockPolicy:
     def __init__(self):
         self.strict = False
         self._reset_count = 0
+        self._action_count = 0
 
     def get_action(self, observation, options=None):
+        self._action_count += 1
         # Echo back a dummy action dict derived from observation keys
         action = {"joint_pos": np.zeros(7, dtype=np.float32)}
-        info = {"mock": True}
+        info = {"mock": True, "inference_count": self._action_count}
         return action, info
 
     def reset(self, options=None):
@@ -55,6 +57,9 @@ class MockPolicy:
                 modality_keys=["joint_pos"],
             )
         }
+
+    def get_metadata(self):
+        return {"schema": "rmbench_gr00t_server_v1", "policy_kind": "vanilla"}
 
     def check_observation(self, observation):
         pass
@@ -113,6 +118,108 @@ class TestPolicyServerClient:
         assert "joint_pos" in action
         np.testing.assert_array_equal(action["joint_pos"], np.zeros(7, dtype=np.float32))
 
+    def test_get_action_echoes_freshness_and_retries_idempotently(self, server_client):
+        client, _, policy = server_client
+        obs = {"state": {"joint_pos": np.zeros(7, dtype=np.float32)}}
+        options = {
+            "episode_id": "episode-a",
+            "request_id": "request-a",
+            "source_step_id": 7,
+            "dry_run": True,
+        }
+
+        first = client.call_endpoint(
+            "get_action", {"observation": obs, "options": options}
+        )
+        retry = client.call_endpoint(
+            "get_action", {"observation": obs, "options": options}
+        )
+
+        assert policy._action_count == 1
+        assert MsgSerializer.to_bytes(first) == MsgSerializer.to_bytes(retry)
+        np.testing.assert_array_equal(first[0]["joint_pos"], retry[0]["joint_pos"])
+        assert first[1]["episode_id"] == options["episode_id"]
+        assert first[1]["request_id"] == options["request_id"]
+        assert first[1]["source_step_id"] == options["source_step_id"]
+
+    def test_robott_retry_preserves_action_and_memory_step(self):
+        class MockRoboTTTPolicy(MockPolicy):
+            use_ttt = True
+
+            def __init__(self):
+                super().__init__()
+                self._memory_step = 0
+
+            def get_action(self, observation, options=None):
+                self._action_count += 1
+                self._memory_step += 1
+                action = {
+                    "joint_pos": np.full(7, self._action_count, dtype=np.float32)
+                }
+                return action, {"ttt": [{"memory_step": self._memory_step}]}
+
+            def reset(self, options=None):
+                assert options["clear_memory"] is True
+                self._memory_step = 0
+                return super().reset(options)
+
+        port = _find_free_port()
+        policy = MockRoboTTTPolicy()
+        options = {
+            "episode_id": "robott-episode",
+            "request_id": "robott-request",
+            "source_step_id": 11,
+        }
+        obs = {"state": {"joint_pos": np.zeros(7, dtype=np.float32)}}
+        with PolicyServer(policy, host="127.0.0.1", port=port) as server:
+            thread = threading.Thread(target=server.run, daemon=True)
+            thread.start()
+            with PolicyClient(host="127.0.0.1", port=port, timeout_ms=5000) as client:
+                first = client.call_endpoint(
+                    "get_action", {"observation": obs, "options": options}
+                )
+                retry = client.call_endpoint(
+                    "get_action", {"observation": obs, "options": options}
+                )
+                count_after_retry = policy._action_count
+                reset = client.call_endpoint(
+                    "reset", {"options": {"clear_memory": False}}
+                )
+                after_reset = client.call_endpoint(
+                    "get_action", {"observation": obs, "options": options}
+                )
+                client.kill_server()
+            thread.join(timeout=2)
+
+        assert count_after_retry == 1
+        assert MsgSerializer.to_bytes(first) == MsgSerializer.to_bytes(retry)
+        np.testing.assert_array_equal(first[0]["joint_pos"], retry[0]["joint_pos"])
+        assert first[1]["memory_step"] == retry[1]["memory_step"] == 1
+        assert reset["memory_step"] == 0
+        assert policy._action_count == 2
+        assert after_reset[1]["memory_step"] == 1
+
+    def test_reset_clears_request_cache(self, server_client):
+        client, _, policy = server_client
+        obs = {"state": {"joint_pos": np.zeros(7, dtype=np.float32)}}
+        options = {
+            "episode_id": "episode-before-reset",
+            "request_id": "same-request",
+            "source_step_id": 0,
+        }
+
+        client.call_endpoint("get_action", {"observation": obs, "options": options})
+        client.call_endpoint("get_action", {"observation": obs, "options": options})
+        assert policy._action_count == 1
+
+        client.call_endpoint("reset", {"options": {"episode_id": "episode-before-reset"}})
+        response = client.call_endpoint(
+            "get_action", {"observation": obs, "options": options}
+        )
+
+        assert policy._action_count == 2
+        assert response[1]["inference_count"] == 2
+
     def test_reset(self, server_client):
         client, _, policy = server_client
         result = client.call_endpoint("reset", {"options": None})
@@ -126,6 +233,12 @@ class TestPolicyServerClient:
         assert "state" in config
         assert isinstance(config["state"], ModalityConfig)
         assert config["state"].modality_keys == ["joint_pos"]
+
+    def test_get_metadata(self, server_client):
+        client, _, _ = server_client
+        metadata = client.get_metadata()
+        assert metadata["schema"] == "rmbench_gr00t_server_v1"
+        assert metadata["policy_kind"] == "vanilla"
 
     def test_kill_server(self):
         """Test that kill_server stops the server loop."""

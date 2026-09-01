@@ -10,8 +10,7 @@ Changes proposed in this pull request:
 ## Before submitting
 
 <!-- Please complete this checklist BEFORE submitting your PR to speed along the review process. -->
-- [ ] I've read and followed all steps in the [Making a pull request](https://github.com/NVIDIA/Isaac-GR00T/blob/main/CONTRIBUTING.md#making-a-pull-request)
-    section of the `CONTRIBUTING` docs.
+- [ ] I've read and followed the repository's [`CONTRIBUTING.md`](../CONTRIBUTING.md).
 - [ ] I've updated or added any relevant docstrings.
 - [ ] If this PR fixes a bug, I've added a test that will fail without my fix.
 - [ ] If this PR adds a new feature, I've added tests that sufficiently cover my new functionality.
